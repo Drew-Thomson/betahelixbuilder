@@ -106,3 +106,32 @@ fn monomer_pdb_roundtrip_energy_matches_in_memory() {
     );
     assert!((mem_score.total - pdb_score.total).abs() < 0.2);
 }
+
+#[test]
+fn capped_and_oxt_chains_parameterize_cleanly_without_covalent_clashes() {
+    let ff = BudeForceField::bude_2016v1().unwrap();
+    let opts = EnergyOptions::standard();
+
+    for raw in ["Ac-AaAaAaAaAaAa-NH2", "Ac-AaAaAaAaAaAa", "AaAaAaAaAaAa-NH2", "AaAaAaAaAaAa"] {
+        let seq = Sequence::parse(raw).unwrap();
+        let chain = build_beta_helix(&seq, &HelixParams::beta_6_3(), 'A').unwrap();
+        let mem = internal_energy(&ScoredStructure::from_chain(&chain), &ff, &opts);
+        let pdb = internal_energy(
+            &ScoredStructure::from_pdb_str(&to_pdb_string(&chain)).unwrap(),
+            &ff,
+            &opts,
+        );
+        assert!(
+            mem.unparameterized_atoms.is_empty(),
+            "unparameterized atoms for {raw}: {:?}",
+            mem.unparameterized_atoms
+        );
+        assert!(
+            pdb.unparameterized_atoms.is_empty(),
+            "unparameterized PDB atoms for {raw}: {:?}",
+            pdb.unparameterized_atoms
+        );
+        assert!((mem.total - pdb.total).abs() < 0.2);
+        assert!(mem.steric < 60.0, "unexpected steric clash for {raw}: {}", mem.steric);
+    }
+}

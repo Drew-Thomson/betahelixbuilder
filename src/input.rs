@@ -174,9 +174,33 @@ impl ResidueSpec {
     }
 }
 
-/// Validated peptide sequence with per-residue stereochemistry.
+/// Optional N-terminal capping group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NCap {
+    /// Free N-terminus (no cap).
+    #[default]
+    None,
+    /// Acetyl cap (`Ac-` / `ACE` at residue 0).
+    Acetyl,
+}
+
+/// C-terminal state (primary amide cap or uncapped carboxylic acid `OXT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CCap {
+    /// Uncapped C-terminus carrying carboxylate `OXT` on the final residue.
+    #[default]
+    Hydroxyl,
+    /// Primary amide cap (`-NH2` / `NH2` at residue `N + 1`).
+    Amide,
+}
+
+/// Validated peptide sequence with per-residue stereochemistry and terminal caps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sequence {
+    pub n_cap: NCap,
+    pub c_cap: CCap,
     pub residues: Vec<ResidueSpec>,
 }
 
@@ -192,17 +216,39 @@ fn flip_parity(parity: Chirality, distance: usize) -> Chirality {
 }
 
 impl Sequence {
-    /// Parses a case-based sequence string (uppercase = L, lowercase = D, uppercase `G` = Gly).
+    /// Parses a case-based sequence string with optional `Ac-` and `-NH2` terminal caps.
     ///
-    /// Glycine backbone parity (L-slot vs D-slot) is inferred from the alternating chirality
-    /// of neighboring non-glycine residues.
+    /// Examples: `"VGAlAv"`, `"Ac-VGAlAv-NH2"`, `"Ac-VGAlAv"`, `"VGAlAv-NH2"`.
+    /// Glycine must be uppercase `'G'`; its backbone parity is inferred from alternating neighbors.
     pub fn parse(raw: &str) -> Result<Self, InputError> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
+        let mut core = raw.trim();
+        if core.is_empty() {
             return Err(InputError::EmptySequence);
         }
-        let mut residues = Vec::with_capacity(trimmed.len());
-        for (idx, ch) in trimmed.chars().enumerate() {
+
+        let n_cap = if core.len() >= 3 && core[..3].eq_ignore_ascii_case("ac-") {
+            core = &core[3..];
+            NCap::Acetyl
+        } else {
+            NCap::None
+        };
+
+        let c_cap = if core.len() >= 4 && core[core.len() - 4..].eq_ignore_ascii_case("-nh2") {
+            core = &core[..core.len() - 4];
+            CCap::Amide
+        } else {
+            CCap::Hydroxyl
+        };
+
+        if core.contains('-') {
+            return Err(InputError::InvalidCapSyntax);
+        }
+        if core.is_empty() {
+            return Err(InputError::EmptySequence);
+        }
+
+        let mut residues = Vec::with_capacity(core.len());
+        for (idx, ch) in core.chars().enumerate() {
             let (residue, chirality, backbone_parity) = CanonicalResidue::from_case_char(ch)?;
             residues.push(ResidueSpec {
                 seq_id: idx + 1,
@@ -245,7 +291,11 @@ impl Sequence {
             }
         }
 
-        Ok(Self { residues })
+        Ok(Self {
+            n_cap,
+            c_cap,
+            residues,
+        })
     }
 
     /// Validates that consecutive residues strictly alternate L/D backbone parity.
@@ -268,9 +318,11 @@ impl Sequence {
             .collect()
     }
 
-    /// Converts all residues to poly-D/L-alanine for Phase 1 backbone modelling.
+    /// Converts all residues to poly-D/L-alanine for backbone modelling while preserving caps.
     pub fn as_poly_ala(&self, keep_gly: bool) -> Self {
         Self {
+            n_cap: self.n_cap,
+            c_cap: self.c_cap,
             residues: self.residues.iter().map(|r| r.to_poly_ala(keep_gly)).collect(),
         }
     }
@@ -377,6 +429,25 @@ impl HelixParams {
             tilt_dl_deg: -86.5,
             handedness: Handedness::Right,
             phase_offset_rad: 0.0,
+        }
+    }
+
+    /// Returns the spatial mirror enantiomer parameters with inverted handedness and L/D roles swapped.
+    pub fn mirror_enantiomer(&self) -> Self {
+        Self {
+            radius_l: self.radius_d,
+            radius_d: self.radius_l,
+            residues_per_turn: self.residues_per_turn,
+            residues_per_turn_profile: self.residues_per_turn_profile.clone(),
+            rise_ld: self.rise_dl,
+            rise_dl: self.rise_ld,
+            tilt_ld_deg: -self.tilt_dl_deg,
+            tilt_dl_deg: -self.tilt_ld_deg,
+            handedness: match self.handedness {
+                Handedness::Right => Handedness::Left,
+                Handedness::Left => Handedness::Right,
+            },
+            phase_offset_rad: -self.phase_offset_rad,
         }
     }
 
@@ -678,6 +749,7 @@ pub enum InputError {
     EmptySequence,
     SequenceTooShort(usize),
     LowercaseGlycine,
+    InvalidCapSyntax,
     NonAlternatingChirality { seq_id: usize },
     UnsupportedResidueChar(char),
     UnsupportedPhase1Residue { seq_id: usize, code: &'static str },
@@ -694,6 +766,9 @@ impl fmt::Display for InputError {
             }
             Self::LowercaseGlycine => {
                 write!(f, "glycine is achiral and must be specified as uppercase 'G'")
+            }
+            Self::InvalidCapSyntax => {
+                write!(f, "invalid cap syntax: only optional 'Ac-' prefix and '-NH2' suffix are supported")
             }
             Self::NonAlternatingChirality { seq_id } => {
                 write!(f, "non-alternating chirality at residue {seq_id}")
@@ -750,6 +825,30 @@ mod tests {
         let keep_gly = Sequence::parse("AGA").unwrap().as_poly_ala(true);
         assert_eq!(keep_gly.residues[1].residue, CanonicalResidue::Gly);
         assert_eq!(keep_gly.residues[1].backbone_parity, Chirality::D);
+    }
+
+    #[test]
+    fn parses_independent_n_and_c_caps() {
+        let full = Sequence::parse("Ac-VGAl-NH2").unwrap();
+        assert_eq!(full.n_cap, NCap::Acetyl);
+        assert_eq!(full.c_cap, CCap::Amide);
+        assert_eq!(full.to_daspr_string(), "VGAl");
+        assert_eq!(full.residues[0].seq_id, 1);
+
+        let n_only = Sequence::parse("Ac-AaAa").unwrap();
+        assert_eq!(n_only.n_cap, NCap::Acetyl);
+        assert_eq!(n_only.c_cap, CCap::Hydroxyl);
+
+        let c_only = Sequence::parse("AaAa-NH2").unwrap();
+        assert_eq!(c_only.n_cap, NCap::None);
+        assert_eq!(c_only.c_cap, CCap::Amide);
+
+        let uncapped = Sequence::parse("AaAa").unwrap();
+        assert_eq!(uncapped.n_cap, NCap::None);
+        assert_eq!(uncapped.c_cap, CCap::Hydroxyl);
+
+        assert_eq!(Sequence::parse("Boc-AaAa"), Err(InputError::InvalidCapSyntax));
+        assert_eq!(Sequence::parse("Ac--NH2"), Err(InputError::EmptySequence));
     }
 
     #[test]

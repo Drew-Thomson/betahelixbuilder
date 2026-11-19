@@ -5,7 +5,7 @@ use std::fmt;
 use nalgebra::{Matrix3, Point3, Vector2, Vector3};
 
 use crate::input::{
-    CanonicalResidue, Chirality, HelixParams, InputError, Sequence, TwistMode,
+    CCap, CanonicalResidue, Chirality, HelixParams, InputError, NCap, Sequence, TwistMode,
 };
 
 const BOND_CA_C: f64 = 1.528;
@@ -13,6 +13,8 @@ const BOND_C_N: f64 = 1.332;
 const BOND_N_CA: f64 = 1.457;
 const BOND_C_O: f64 = 1.233;
 const BOND_CA_CB: f64 = 1.521;
+const BOND_CH3_C: f64 = 1.508;
+const BOND_C_OXT: f64 = 1.250;
 
 const ANGLE_CA_C_N_DEG: f64 = 117.3;
 const ANGLE_C_N_CA_DEG: f64 = 124.2;
@@ -20,6 +22,22 @@ const ANGLE_CA_C_O_DEG: f64 = 120.8;
 const ANGLE_N_CA_CB_DEG: f64 = 110.3;
 
 const EPS: f64 = 1e-12;
+
+/// N-terminal acetyl cap (`ACE`, residue 0).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcetylCap {
+    pub seq_id: usize,
+    pub ch3: Point3<f64>,
+    pub c: Point3<f64>,
+    pub o: Point3<f64>,
+}
+
+/// C-terminal primary amide cap (`NH2`, residue `N + 1`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AmideCap {
+    pub seq_id: usize,
+    pub n: Point3<f64>,
+}
 
 /// Backbone and Cβ atomic coordinates for one residue.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,13 +50,16 @@ pub struct ResidueAtoms {
     pub c: Point3<f64>,
     pub o: Point3<f64>,
     pub cb: Option<Point3<f64>>,
+    pub oxt: Option<Point3<f64>>,
 }
 
-/// Generated polypeptide chain.
+/// Generated polypeptide chain with optional terminal caps.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chain {
     pub chain_id: char,
+    pub n_cap: Option<AcetylCap>,
     pub residues: Vec<ResidueAtoms>,
+    pub c_cap: Option<AmideCap>,
 }
 
 /// Errors produced during structure generation or RMSD evaluation.
@@ -333,7 +354,20 @@ pub fn build_helix_along_curve(
         + samples[0].radial_in * (prev_r * prev_psi.cos())
         + samples[0].binormal * (prev_r * prev_psi.sin());
     let center_mid_prev = Point3::from(0.5 * (center_prev.coords + samples[0].center.coords));
-    ns[0] = place_peptide_plane(ca_prev, cas[0], center_mid_prev, prev_tilt)?.n_next;
+    let prev_plane = place_peptide_plane(ca_prev, cas[0], center_mid_prev, prev_tilt)?;
+    ns[0] = prev_plane.n_next;
+    let n_cap = match sequence.n_cap {
+        NCap::None => None,
+        NCap::Acetyl => {
+            let ch3 = prev_plane.c + (ca_prev - prev_plane.c).normalize() * BOND_CH3_C;
+            Some(AcetylCap {
+                seq_id: 0,
+                ch3,
+                c: prev_plane.c,
+                o: prev_plane.o,
+            })
+        }
+    };
 
     let last_parity = sequence.residues[n_res - 1].backbone_parity;
     let next_parity = opposite_parity(last_parity);
@@ -355,6 +389,20 @@ pub fn build_helix_along_curve(
     cs[n_res - 1] = last_plane.c;
     os[n_res - 1] = last_plane.o;
 
+    let (c_cap, last_oxt) = match sequence.c_cap {
+        CCap::Amide => (
+            Some(AmideCap {
+                seq_id: sequence.residues[n_res - 1].seq_id + 1,
+                n: last_plane.n_next,
+            }),
+            None,
+        ),
+        CCap::Hydroxyl => {
+            let oxt = last_plane.c + (last_plane.n_next - last_plane.c).normalize() * BOND_C_OXT;
+            (None, Some(oxt))
+        }
+    };
+
     let mut residues = Vec::with_capacity(n_res);
     for i in 0..n_res {
         let spec = &sequence.residues[i];
@@ -372,10 +420,16 @@ pub fn build_helix_along_curve(
             c: cs[i],
             o: os[i],
             cb,
+            oxt: if i + 1 == n_res { last_oxt } else { None },
         });
     }
 
-    Ok(Chain { chain_id, residues })
+    Ok(Chain {
+        chain_id,
+        n_cap,
+        residues,
+        c_cap,
+    })
 }
 
 /// Generates a Crick-style parametric beta-helix backbone for `sequence` and `params`.
@@ -606,5 +660,37 @@ mod tests {
         let moved: Vec<_> = pts.iter().map(|&p| rot * p + shift).collect();
         let rmsd = kabsch_rmsd(&pts, &moved).unwrap();
         assert!(rmsd < 1e-10, "expected ~0 RMSD, got {rmsd}");
+    }
+
+    #[test]
+    fn places_acetyl_amide_caps_and_uncapped_oxt_with_exact_geometry() {
+        let capped_seq = Sequence::parse("Ac-AaAa-NH2").unwrap();
+        let capped = build_beta_helix(&capped_seq, &HelixParams::beta_6_3(), 'A').unwrap();
+        let ace = capped.n_cap.as_ref().expect("expected ACE cap");
+        let nh2 = capped.c_cap.as_ref().expect("expected NH2 cap");
+        assert_eq!(ace.seq_id, 0);
+        assert_eq!(nh2.seq_id, 5);
+        assert!(capped.residues.last().unwrap().oxt.is_none());
+
+        assert!((bond_length(ace.ch3, ace.c) - BOND_CH3_C).abs() < 1e-6);
+        assert!((bond_length(ace.c, capped.residues[0].n) - BOND_C_N).abs() < 1e-6);
+        assert!((bond_length(ace.c, ace.o) - BOND_C_O).abs() < 1e-6);
+        let om_n = dihedral_deg(ace.ch3, ace.c, capped.residues[0].n, capped.residues[0].ca);
+        assert!(om_n.abs() > 179.9, "non-trans ACE omega: {om_n}");
+
+        let last = capped.residues.last().unwrap();
+        assert!((bond_length(last.c, nh2.n) - BOND_C_N).abs() < 1e-6);
+        let om_c = dihedral_deg(last.ca, last.c, nh2.n, last.o);
+        assert!(om_c.abs() > 179.9, "non-planar C-terminal amide: {om_c}");
+
+        let uncapped_seq = Sequence::parse("AaAa").unwrap();
+        let uncapped = build_beta_helix(&uncapped_seq, &HelixParams::beta_6_3(), 'A').unwrap();
+        assert!(uncapped.n_cap.is_none());
+        assert!(uncapped.c_cap.is_none());
+        let last_u = uncapped.residues.last().unwrap();
+        let oxt = last_u.oxt.expect("uncapped chain must have OXT");
+        assert!((bond_length(last_u.c, oxt) - BOND_C_OXT).abs() < 1e-6);
+        let planarity = dihedral_deg(last_u.ca, last_u.c, last_u.o, oxt);
+        assert!(planarity.abs() > 179.9, "non-planar carboxylate: {planarity}");
     }
 }

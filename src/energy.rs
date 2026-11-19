@@ -409,46 +409,86 @@ fn pick_reference_pos(atoms: &[ScoredAtom]) -> Point3<f64> {
 }
 
 fn convert_chain(chain: &Chain) -> ScoredChain {
-    let residues = chain
-        .residues
-        .iter()
-        .map(|r| {
-            let mut atoms = Vec::with_capacity(5);
+    let mut residues = Vec::with_capacity(chain.residues.len() + 2);
+    if let Some(ace) = &chain.n_cap {
+        residues.push(ScoredResidue {
+            seq_id: ace.seq_id as i32,
+            res_name: "ACE".to_string(),
+            atoms: vec![
+                ScoredAtom {
+                    atom_name: "CH3".to_string(),
+                    element: "C".to_string(),
+                    pos: ace.ch3,
+                },
+                ScoredAtom {
+                    atom_name: "C".to_string(),
+                    element: "C".to_string(),
+                    pos: ace.c,
+                },
+                ScoredAtom {
+                    atom_name: "O".to_string(),
+                    element: "O".to_string(),
+                    pos: ace.o,
+                },
+            ],
+            reference_pos: ace.c,
+        });
+    }
+    for r in &chain.residues {
+        let mut atoms = Vec::with_capacity(6);
+        atoms.push(ScoredAtom {
+            atom_name: "N".to_string(),
+            element: "N".to_string(),
+            pos: r.n,
+        });
+        atoms.push(ScoredAtom {
+            atom_name: "CA".to_string(),
+            element: "C".to_string(),
+            pos: r.ca,
+        });
+        atoms.push(ScoredAtom {
+            atom_name: "C".to_string(),
+            element: "C".to_string(),
+            pos: r.c,
+        });
+        atoms.push(ScoredAtom {
+            atom_name: "O".to_string(),
+            element: "O".to_string(),
+            pos: r.o,
+        });
+        if let Some(cb) = r.cb {
             atoms.push(ScoredAtom {
+                atom_name: "CB".to_string(),
+                element: "C".to_string(),
+                pos: cb,
+            });
+        }
+        if let Some(oxt) = r.oxt {
+            atoms.push(ScoredAtom {
+                atom_name: "OXT".to_string(),
+                element: "O".to_string(),
+                pos: oxt,
+            });
+        }
+        residues.push(ScoredResidue {
+            seq_id: r.seq_id as i32,
+            res_name: r.res_name.to_string(),
+            atoms,
+            reference_pos: r.ca,
+        });
+    }
+    if let Some(nh2) = &chain.c_cap {
+        residues.push(ScoredResidue {
+            seq_id: nh2.seq_id as i32,
+            res_name: "NH2".to_string(),
+            atoms: vec![ScoredAtom {
                 atom_name: "N".to_string(),
                 element: "N".to_string(),
-                pos: r.n,
-            });
-            atoms.push(ScoredAtom {
-                atom_name: "CA".to_string(),
-                element: "C".to_string(),
-                pos: r.ca,
-            });
-            atoms.push(ScoredAtom {
-                atom_name: "C".to_string(),
-                element: "C".to_string(),
-                pos: r.c,
-            });
-            atoms.push(ScoredAtom {
-                atom_name: "O".to_string(),
-                element: "O".to_string(),
-                pos: r.o,
-            });
-            if let Some(cb) = r.cb {
-                atoms.push(ScoredAtom {
-                    atom_name: "CB".to_string(),
-                    element: "C".to_string(),
-                    pos: cb,
-                });
-            }
-            ScoredResidue {
-                seq_id: r.seq_id as i32,
-                res_name: r.res_name.to_string(),
-                atoms,
-                reference_pos: r.ca,
-            }
-        })
-        .collect();
+                pos: nh2.n,
+            }],
+            reference_pos: nh2.n,
+        });
+    }
     ScoredChain {
         chain_id: chain.chain_id,
         residues,
@@ -541,6 +581,36 @@ struct IndexedResidue<'a> {
     atoms: Vec<(&'a ScoredAtom, &'a AtomFfParams)>,
 }
 
+fn index_residue<'a>(
+    chain_id: char,
+    res: &'a ScoredResidue,
+    ff: &'a BudeForceField,
+    sidechain_only: bool,
+    unparameterized: &mut Vec<String>,
+) -> IndexedResidue<'a> {
+    let mut atoms = Vec::with_capacity(res.atoms.len());
+    for atom in &res.atoms {
+        if sidechain_only && BACKBONE_ATOMS.contains(&atom.atom_name.as_str()) {
+            continue;
+        }
+        if let Some(params) = ff.resolve_atom_params(&res.res_name, &atom.atom_name) {
+            atoms.push((atom, params));
+        } else {
+            unparameterized.push(format!(
+                "{chain_id}:{} {} {}",
+                res.seq_id, res.res_name, atom.atom_name
+            ));
+        }
+    }
+    IndexedResidue {
+        chain_id,
+        seq_id: res.seq_id,
+        res_name: &res.res_name,
+        reference_pos: res.reference_pos,
+        atoms,
+    }
+}
+
 fn index_chain<'a>(
     chain: &'a ScoredChain,
     ff: &'a BudeForceField,
@@ -549,27 +619,16 @@ fn index_chain<'a>(
     chain
         .residues
         .iter()
-        .map(|res| {
-            let mut atoms = Vec::with_capacity(res.atoms.len());
-            for atom in &res.atoms {
-                if let Some(params) = ff.resolve_atom_params(&res.res_name, &atom.atom_name) {
-                    atoms.push((atom, params));
-                } else {
-                    unparameterized.push(format!(
-                        "{}:{} {} {}",
-                        chain.chain_id, res.seq_id, res.res_name, atom.atom_name
-                    ));
-                }
-            }
-            IndexedResidue {
-                chain_id: chain.chain_id,
-                seq_id: res.seq_id,
-                res_name: &res.res_name,
-                reference_pos: res.reference_pos,
-                atoms,
-            }
-        })
+        .map(|res| index_residue(chain.chain_id, res, ff, false, unparameterized))
         .collect()
+}
+
+fn is_adjacent_backbone_atom(res_name: &str, atom_name: &str) -> bool {
+    match res_name {
+        "ACE" => matches!(atom_name, "CH3" | "C" | "O"),
+        "NH2" => atom_name == "N",
+        _ => BACKBONE_ATOMS.contains(&atom_name),
+    }
 }
 
 fn score_residue_pairs(
@@ -602,9 +661,9 @@ fn score_residue_pairs(
 
             for &(atom_a, params_a) in &ra.atoms {
                 let a_is_bb = adjacent_same_chain
-                    && BACKBONE_ATOMS.contains(&atom_a.atom_name.as_str());
+                    && is_adjacent_backbone_atom(ra.res_name, &atom_a.atom_name);
                 for &(atom_b, params_b) in &rb.atoms {
-                    if a_is_bb && BACKBONE_ATOMS.contains(&atom_b.atom_name.as_str()) {
+                    if a_is_bb && is_adjacent_backbone_atom(rb.res_name, &atom_b.atom_name) {
                         continue;
                     }
                     let dist_sq = (atom_a.pos - atom_b.pos).norm_squared();
@@ -658,6 +717,45 @@ pub fn internal_energy(
         residues.extend(index_chain(chain, ff, &mut unparameterized));
     }
     score_residue_pairs(&residues, None, ff, options, unparameterized)
+}
+
+/// Computes the direct BUDEFF interaction energy between residues `seq_a` and `seq_b` in `chain_id`.
+///
+/// Residues are ordered ascending by `seq_id` so adjacent-backbone filtering matches
+/// [`internal_energy`] for `|seq_a - seq_b| == 1`. Set `sidechain_only` to exclude
+/// backbone `N`, `CA`, `C`, and `O` atoms.
+pub fn direct_residue_pair_energy(
+    structure: &ScoredStructure,
+    ff: &BudeForceField,
+    chain_id: char,
+    seq_a: i32,
+    seq_b: i32,
+    sidechain_only: bool,
+    options: &EnergyOptions,
+) -> EnergyScore {
+    if seq_a == seq_b {
+        return EnergyScore::default();
+    }
+    let Some(chain) = structure.chains.iter().find(|c| c.chain_id == chain_id) else {
+        return EnergyScore::default();
+    };
+    let (lo, hi) = if seq_a < seq_b {
+        (seq_a, seq_b)
+    } else {
+        (seq_b, seq_a)
+    };
+    let (Some(res_lo), Some(res_hi)) = (
+        chain.residues.iter().find(|r| r.seq_id == lo),
+        chain.residues.iter().find(|r| r.seq_id == hi),
+    ) else {
+        return EnergyScore::default();
+    };
+    let mut unparameterized = Vec::new();
+    let indexed = [
+        index_residue(chain_id, res_lo, ff, sidechain_only, &mut unparameterized),
+        index_residue(chain_id, res_hi, ff, sidechain_only, &mut unparameterized),
+    ];
+    score_residue_pairs(&indexed, None, ff, options, unparameterized)
 }
 
 /// Computes the BUDEFF inter-chain interaction energy across all distinct chain pairs.
@@ -809,10 +907,71 @@ mod tests {
             if let Some(cb) = &mut res.cb {
                 *cb = rot * (*cb) + shift;
             }
+            if let Some(oxt) = &mut res.oxt {
+                *oxt = rot * (*oxt) + shift;
+            }
         }
         let s2 = ScoredStructure::from_chain(&moved_chain);
         let e2 = internal_energy(&s2, &ff, &opts);
         assert!((e1.total - e2.total).abs() < 1e-10);
         assert_eq!(e1.interactions.len(), e2.interactions.len());
+    }
+
+    #[test]
+    fn direct_residue_pair_matches_internal_interactions_and_respects_order() {
+        let seq = Sequence::parse("AaAaAaAaAaAa").unwrap();
+        let chain = build_beta_helix(&seq, &HelixParams::beta_6_3(), 'A').unwrap();
+        let ff = BudeForceField::bude_2016v1().unwrap();
+        let opts = EnergyOptions {
+            include_interactions: true,
+            ..EnergyOptions::standard()
+        };
+        let structure = ScoredStructure::from_chain(&chain);
+        let full = internal_energy(&structure, &ff, &opts);
+
+        for &(a, b) in &[(3_i32, 9_i32), (3, 4), (4, 3)] {
+            let lo = a.min(b);
+            let hi = a.max(b);
+            let expected: f64 = full
+                .interactions
+                .iter()
+                .filter(|x| x.seq_id_a == lo && x.seq_id_b == hi)
+                .map(|x| x.steric + x.desolvation + x.charge)
+                .sum();
+            let direct = direct_residue_pair_energy(&structure, &ff, 'A', a, b, false, &opts);
+            assert!(
+                (direct.total - expected).abs() < 1e-12,
+                "pair ({a},{b}) mismatch: {} vs {expected}",
+                direct.total
+            );
+        }
+
+        let sc_only = direct_residue_pair_energy(&structure, &ff, 'A', 3, 9, true, &opts);
+        for inter in &sc_only.interactions {
+            assert!(!BACKBONE_ATOMS.contains(&inter.atom_name_a.as_str()));
+            assert!(!BACKBONE_ATOMS.contains(&inter.atom_name_b.as_str()));
+        }
+    }
+
+    #[test]
+    fn mirror_enantiomer_has_identical_internal_energy_for_inverted_chirality_sequence() {
+        let ff = BudeForceField::bude_2016v1().unwrap();
+        let opts = EnergyOptions::standard();
+
+        let seq_r = Sequence::parse("Ac-AaAaAaAaAaAaAaAaAaAaAaAaAaAaAa-NH2").unwrap();
+        let chain_r = build_beta_helix(&seq_r, &HelixParams::beta_6_3(), 'A').unwrap();
+        let e_r = internal_energy(&ScoredStructure::from_chain(&chain_r), &ff, &opts);
+
+        let seq_l = Sequence::parse("Ac-aAaAaAaAaAaAaAaAaAaAaAaAaAaAaA-NH2").unwrap();
+        let mirror_params = HelixParams::beta_6_3().mirror_enantiomer();
+        let chain_l = build_beta_helix(&seq_l, &mirror_params, 'A').unwrap();
+        let e_l = internal_energy(&ScoredStructure::from_chain(&chain_l), &ff, &opts);
+
+        assert!(
+            (e_r.total - e_l.total).abs() < 1e-10,
+            "mirror internal energy mismatch: right={} vs left={}",
+            e_r.total,
+            e_l.total
+        );
     }
 }

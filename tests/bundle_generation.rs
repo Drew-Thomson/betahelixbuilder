@@ -111,7 +111,8 @@ helices:
     assert!((mean_z(2) + 2.0).abs() < 1e-10);
 
     let pdb = bundle_to_pdb_string(&bundle);
-    assert_eq!(pdb.lines().filter(|l| l.starts_with("ATOM  ")).count(), 180);
+    // 3 chains * (12 * 5 + 1 OXT) = 183 ATOM records
+    assert_eq!(pdb.lines().filter(|l| l.starts_with("ATOM  ")).count(), 183);
     assert_eq!(pdb.lines().filter(|l| l.starts_with("TER   ")).count(), 3);
     assert_eq!(pdb.lines().filter(|l| *l == "END").count(), 1);
 }

@@ -2,15 +2,17 @@
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
-use std::path::PathBuf;
-use std::process;
+use std::path::{Path, PathBuf};
+use std::process::{self, Command as ProcessCommand};
 
 use betahelixbuilder::{
-    BudeForceField, BundleEnergyReport, BundleSpec, DasprConfig, EnergyOptions, EnergyScore,
-    Handedness, HelixParams, HelixPlacementParams, MonomerSpec, OptObjective, OptimizeSpec,
-    Orientation, ParamValue, ScoredStructure, Sequence, Symmetry, TwistMode, build_beta_helix,
-    build_bundle, bundle_target_sequences, bundle_to_pdb_string, evaluate_bundle,
-    interaction_energy, internal_energy, optimize_bundle, pack_bundle, pack_chain, to_pdb_string,
+    AnchorParity, BudeForceField, BundleEnergyReport, BundleSpec, CCap, CanonicalResidue,
+    Chirality, DasprConfig, DesignConfig, DesignConstraints, EnergyOptions, EnergyScore, FrameMode,
+    Handedness, HelixParams, HelixPlacementParams, MonomerSpec, NCap, OptObjective, OptimizeSpec,
+    Orientation, PairSurrogateModel, ParamValue, ProbeConfig, RankBy, ScoredStructure, Sequence,
+    Symmetry, TwistMode, build_beta_helix, build_bundle, bundle_target_sequences,
+    bundle_to_pdb_string, design_sequences, evaluate_bundle, interaction_energy, internal_energy,
+    optimize_bundle, pack_bundle, pack_chain, probe_pair_interactions, to_pdb_string,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -88,6 +90,46 @@ impl From<CliOptObjective> for OptObjective {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliAnchorParity {
+    L,
+    D,
+    Both,
+}
+
+impl From<CliAnchorParity> for AnchorParity {
+    fn from(a: CliAnchorParity) -> Self {
+        match a {
+            CliAnchorParity::L => Self::L,
+            CliAnchorParity::D => Self::D,
+            CliAnchorParity::Both => Self::Both,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliRankBy {
+    Dmc,
+    VsAla,
+    DirectPair,
+}
+
+impl From<CliRankBy> for RankBy {
+    fn from(r: CliRankBy) -> Self {
+        match r {
+            CliRankBy::Dmc => Self::Dmc,
+            CliRankBy::VsAla => Self::VsAla,
+            CliRankBy::DirectPair => Self::DirectPair,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliFrameMode {
+    Alternating,
+    Strict,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "betahelixbuilder")]
 #[command(about = "Parametric Crick-style beta-helix monomer, bundle, and BUDE energy tool")]
@@ -106,6 +148,10 @@ enum Command {
     Score(ScoreArgs),
     /// Optimise bundle parameters via Differential Evolution with implicit dASPR packing.
     Optimize(Box<OptimizeArgs>),
+    /// Systematically probe pairwise L/D side-chain couplings across beta-helix offsets.
+    ProbePairs(ProbePairsArgs),
+    /// Design stable, handedness-specific repetitive beta-helix sequences (~30 residues).
+    DesignSeq(Box<DesignSeqArgs>),
 }
 
 #[derive(Debug, Args, Default)]
@@ -417,6 +463,240 @@ struct OptimizeArgs {
     /// Optional JSON file path for full evaluation history.
     #[arg(long)]
     history_json: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ProbePairsArgs {
+    /// Optional YAML monomer configuration file supplying host `HelixParams`.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Backbone parameter preset for the host beta-helix.
+    #[arg(long, value_enum)]
+    preset: Option<Preset>,
+
+    /// Host poly-(L/D-Ala) peptide length.
+    #[arg(long, default_value_t = 22)]
+    host_length: usize,
+
+    /// Comma-separated relative partner offsets `j - i` to scan.
+    #[arg(long, default_value = "-1,1,5,6,7", allow_hyphen_values = true)]
+    offsets: String,
+
+    /// Which anchor chirality position(s) to scan.
+    #[arg(long, value_enum, default_value = "both")]
+    anchor: CliAnchorParity,
+
+    /// Exclude Proline (`P`/`p`) from the scanned residue alphabet.
+    #[arg(long)]
+    exclude_proline: bool,
+
+    /// Optional comma-separated uppercase one-letter residue subset (e.g. `A,W,D,K,P`).
+    #[arg(long)]
+    residues: Option<String>,
+
+    /// Primary ranking metric for sorting CSV and summary tables.
+    #[arg(long, value_enum, default_value = "dmc")]
+    rank_by: CliRankBy,
+
+    /// Number of top/bottom pairs printed per `(anchor, offset)` summary table.
+    #[arg(long, default_value_t = 10)]
+    top: usize,
+
+    /// Threshold on `max |ddE_L - ddE_D|` for flagging L-vs-D asymmetry.
+    #[arg(long, default_value_t = 0.5)]
+    parity_max_diff: f64,
+
+    /// Threshold on RMSD(ddE_L, ddE_D) for flagging L-vs-D asymmetry.
+    #[arg(long, default_value_t = 0.15)]
+    parity_rmsd: f64,
+
+    /// Fail immediately instead of recording NaN if an external dASPR call errors on an isolated pair.
+    #[arg(long)]
+    strict: bool,
+
+    /// Parallel rayon worker threads.
+    #[arg(long)]
+    threads: Option<usize>,
+
+    /// Path to dASPR binary (defaults to DASPR_BIN, PATH, or ~/dASPR/dASPR).
+    #[arg(long)]
+    daspr_bin: Option<PathBuf>,
+
+    /// Path to dASPR rotamer library (`dun2010_mirror.bin`).
+    #[arg(long)]
+    rotlib: Option<PathBuf>,
+
+    /// Override BUDE force-field JSON path.
+    #[arg(long)]
+    force_field: Option<PathBuf>,
+
+    /// Mirror budeff C++ unassigned electrostaticType behavior.
+    #[arg(long)]
+    legacy_electrostatics: bool,
+
+    /// Output CSV file path containing all ranked pairings and decomposed metrics.
+    #[arg(short, long, default_value = "pair_scan_ranked.csv")]
+    output: PathBuf,
+
+    /// Optional directory to write per-(anchor, offset) 20x20 matrix CSVs.
+    #[arg(long)]
+    matrix_dir: Option<PathBuf>,
+
+    /// Optional directory to render heatmap & L-vs-D parity PNG plots via Python/Matplotlib.
+    #[arg(long)]
+    plot_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct DesignSeqArgs {
+    /// Precomputed `probe-pairs` CSV file to build Stage-1 surrogate without re-running `probe-pairs`.
+    #[arg(long)]
+    pair_csv: Option<PathBuf>,
+
+    /// Handedness under which `--pair-csv` was recorded (default: right).
+    #[arg(long, value_enum, default_value = "right")]
+    pair_handedness: CliHandedness,
+
+    /// Optional YAML monomer configuration supplying target `HelixParams`.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Target backbone parameter preset.
+    #[arg(long, value_enum)]
+    preset: Option<Preset>,
+
+    /// Target helical handedness to stabilize relative to its mirror enantiomer decoy.
+    #[arg(long, value_enum)]
+    target_handedness: Option<CliHandedness>,
+
+    /// Designed peptide length in residues (default 30 = 5 hexapeptide turns).
+    #[arg(long, default_value_t = 30)]
+    length: usize,
+
+    /// Disable N-terminal acetyl cap (`Ac-`).
+    #[arg(long)]
+    no_n_cap: bool,
+
+    /// Disable C-terminal primary amide cap (`-NH2`).
+    #[arg(long)]
+    no_c_cap: bool,
+
+    /// Repeat template mode (`alternating` 12-mer super-repeat or `strict` 6-mer repeat).
+    #[arg(long, value_enum, default_value = "alternating")]
+    frame_mode: CliFrameMode,
+
+    /// Maximum differing columns between alternating 6-mer halves (`A` and `B`).
+    #[arg(long, default_value_t = 2)]
+    max_alternating_cols: usize,
+
+    /// Allow Cysteine (`C`/`c`) in designed sequences.
+    #[arg(long)]
+    allow_cys: bool,
+
+    /// Allow Methionine (`M`/`m`) in designed sequences.
+    #[arg(long)]
+    allow_met: bool,
+
+    /// Exclude Arginine (`R`/`r`), leaving Lysine as the positive charge option.
+    #[arg(long)]
+    exclude_arg: bool,
+
+    /// Allow Proline (`P`/`p`) in the repeating core frame.
+    #[arg(long)]
+    allow_pro: bool,
+
+    /// Allow Proline (`P`/`p`) in the first/last 4 terminal residues during `--refine`.
+    #[arg(long)]
+    allow_terminal_pro: bool,
+
+    /// Minimum formal net charge (default +1).
+    #[arg(long, default_value_t = 1)]
+    min_charge: i32,
+
+    /// Maximum formal net charge (default +4).
+    #[arg(long, default_value_t = 4)]
+    max_charge: i32,
+
+    /// Minimum total Trp + Tyr residue count (default 1).
+    #[arg(long, default_value_t = 1)]
+    min_trp_tyr: usize,
+
+    /// Optional maximum total aromatic (`Phe` + `Tyr` + `Trp`) count across the sequence.
+    #[arg(long)]
+    max_aromatic: Option<usize>,
+
+    /// Optional maximum Histidine (`His`) count across the sequence.
+    #[arg(long)]
+    max_his: Option<usize>,
+
+    /// Minimum count of soluble polar/charged residues (`S,T,N,Q,H,D,E,K,R`).
+    #[arg(long, default_value_t = 0)]
+    min_polar: usize,
+
+    /// Handedness specificity weight (`score = E_target - weight * (E_decoy - E_target)`).
+    #[arg(long, default_value_t = 0.5)]
+    specificity_weight: f64,
+
+    /// Number of Stage-1 Simulated Annealing restarts.
+    #[arg(long, default_value_t = 32)]
+    sa_restarts: usize,
+
+    /// Steps per Stage-1 Simulated Annealing trajectory.
+    #[arg(long, default_value_t = 6000)]
+    sa_steps: usize,
+
+    /// Number of Stage-1 Pareto-diverse candidates verified in full 3D (`dASPR` + `BUDEFF`).
+    #[arg(long, default_value_t = 25)]
+    top_k_3d: usize,
+
+    /// Polish first/last 4 residues of top candidates directly in 3D (`dASPR` + `BUDEFF`).
+    #[arg(long)]
+    refine: bool,
+
+    /// Number of top 3D candidates refined when `--refine` is active.
+    #[arg(long, default_value_t = 4)]
+    refine_top_n: usize,
+
+    /// Number of top candidates displayed to stdout.
+    #[arg(long, default_value_t = 10)]
+    top: usize,
+
+    /// Deterministic Stage-1 PRNG seed.
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+
+    /// Parallel rayon worker threads.
+    #[arg(long)]
+    threads: Option<usize>,
+
+    /// Path to dASPR binary (defaults to DASPR_BIN, PATH, or ~/dASPR/dASPR).
+    #[arg(long)]
+    daspr_bin: Option<PathBuf>,
+
+    /// Path to dASPR rotamer library (`dun2010_mirror.bin`).
+    #[arg(long)]
+    rotlib: Option<PathBuf>,
+
+    /// Override BUDE force-field JSON path.
+    #[arg(long)]
+    force_field: Option<PathBuf>,
+
+    /// Mirror budeff C++ unassigned electrostaticType behavior.
+    #[arg(long)]
+    legacy_electrostatics: bool,
+
+    /// Ranked CSV output path.
+    #[arg(short, long, default_value = "designed_sequences.csv")]
+    output: PathBuf,
+
+    /// Optional directory to write packed 3D target & mirror-decoy PDBs for top candidates.
+    #[arg(long)]
+    pdb_dir: Option<PathBuf>,
+
+    /// Optional output PNG path for Stability vs Handedness Pareto plot.
+    #[arg(long)]
+    plot: Option<PathBuf>,
 }
 
 fn default_sequence(preset: Preset) -> &'static str {
@@ -819,6 +1099,264 @@ fn run_optimize(args: Box<OptimizeArgs>) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+fn parse_probe_offsets(raw: &str) -> Result<Vec<isize>, Box<dyn std::error::Error>> {
+    let mut offsets = Vec::new();
+    for tok in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        offsets.push(tok.parse::<isize>()?);
+    }
+    Ok(offsets)
+}
+
+fn parse_probe_residues(raw: &str) -> Result<Vec<CanonicalResidue>, Box<dyn std::error::Error>> {
+    let mut residues = Vec::new();
+    for tok in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let mut chars = tok.chars();
+        let ch = chars
+            .next()
+            .ok_or_else(|| format!("empty residue token in '{raw}'"))?;
+        if chars.next().is_some() {
+            return Err(format!("expected single-letter residue code, got '{tok}'").into());
+        }
+        let (res, _, _) = CanonicalResidue::from_case_char(ch.to_ascii_uppercase())?;
+        residues.push(res);
+    }
+    Ok(residues)
+}
+
+fn find_repo_script(filename: &str) -> Option<PathBuf> {
+    let rel = PathBuf::from("scripts").join(filename);
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join(filename);
+    [rel, manifest].into_iter().find(|p| p.is_file())
+}
+
+fn preset_params(preset: Preset) -> HelixParams {
+    match preset {
+        Preset::Beta63 => HelixParams::beta_6_3(),
+        Preset::Gramicidin => HelixParams::beta_6_3_gramicidin(),
+        Preset::Polytheonamide => HelixParams::beta_6_3_polytheonamide(),
+    }
+}
+
+fn anchor_slug(chirality: Chirality) -> &'static str {
+    match chirality {
+        Chirality::L => "L",
+        Chirality::D => "D",
+        Chirality::Achiral => "Achiral",
+    }
+}
+
+fn offset_slug(offset: isize) -> String {
+    if offset >= 0 {
+        format!("p{offset}")
+    } else {
+        format!("m{}", offset.unsigned_abs())
+    }
+}
+
+fn run_probe_pairs(args: ProbePairsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cfg = ProbeConfig {
+        host_length: args.host_length,
+        offsets: parse_probe_offsets(&args.offsets)?,
+        anchor: args.anchor.into(),
+        include_proline: !args.exclude_proline,
+        rank_by: args.rank_by.into(),
+        parity_max_diff_threshold: args.parity_max_diff,
+        parity_rmsd_threshold: args.parity_rmsd,
+        skip_pack_errors: !args.strict,
+        threads: args.threads,
+        ..ProbeConfig::default()
+    };
+
+    if let Some(config_path) = &args.config {
+        let mono = serde_yml::from_str::<MonomerSpec>(&fs::read_to_string(config_path)?)?;
+        cfg.minor_params = mono.params;
+    }
+    if let Some(preset) = args.preset {
+        cfg.minor_params = preset_params(preset);
+    }
+    if let Some(res_str) = &args.residues {
+        cfg.residues = Some(parse_probe_residues(res_str)?);
+    }
+
+    let ff = match &args.force_field {
+        Some(p) => BudeForceField::from_file(p)?,
+        None => BudeForceField::load_default()?,
+    };
+    let energy_opts = EnergyOptions {
+        include_interactions: false,
+        no_neighbour_backbone: true,
+        legacy_unassigned_electrostatic_type: args.legacy_electrostatics,
+    };
+    let daspr_cfg = DasprConfig {
+        daspr_bin: args.daspr_bin,
+        rotlib_path: args.rotlib,
+    };
+
+    let report = probe_pair_interactions(&cfg, &ff, &energy_opts, &daspr_cfg)?;
+    if let Some(parent) = args.output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&args.output, report.to_csv())?;
+
+    if let Some(matrix_dir) = &args.matrix_dir {
+        fs::create_dir_all(matrix_dir)?;
+        for chirality in cfg.anchor.active_chirality_slots() {
+            for &offset in &report.offsets {
+                for &metric in &[RankBy::Dmc, RankBy::VsAla, RankBy::DirectPair] {
+                    let filename = format!(
+                        "{}_{}_{}.csv",
+                        metric.slug(),
+                        anchor_slug(chirality),
+                        offset_slug(offset)
+                    );
+                    let path = Path::new(matrix_dir).join(filename);
+                    fs::write(path, report.matrix_csv(chirality, offset, metric)?)?;
+                }
+            }
+        }
+    }
+
+    print!("{}", report.format_summary(args.top));
+
+    if let Some(plot_dir) = &args.plot_dir {
+        let script = find_repo_script("plot_pair_heatmaps.py").ok_or(
+            "could not locate scripts/plot_pair_heatmaps.py relative to cwd or CARGO_MANIFEST_DIR",
+        )?;
+        let status = ProcessCommand::new("python3")
+            .arg(&script)
+            .arg(&args.output)
+            .arg("--output-dir")
+            .arg(plot_dir)
+            .arg("--metric")
+            .arg(match cfg.rank_by {
+                RankBy::Dmc => "ddE_dmc",
+                RankBy::VsAla => "dE_vs_ala",
+                RankBy::DirectPair => "direct_total",
+            })
+            .status()?;
+        if !status.success() {
+            return Err(format!("heatmap plotting script exited with {status}").into());
+        }
+    }
+    Ok(())
+}
+
+fn run_design_seq(args: DesignSeqArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut target_params = HelixParams::beta_6_3();
+    if let Some(config_path) = &args.config {
+        let mono = serde_yml::from_str::<MonomerSpec>(&fs::read_to_string(config_path)?)?;
+        target_params = mono.params;
+    }
+    if let Some(preset) = args.preset {
+        target_params = preset_params(preset);
+    }
+    if let Some(handedness) = args.target_handedness {
+        let desired: Handedness = handedness.into();
+        if target_params.handedness != desired {
+            target_params = target_params.mirror_enantiomer();
+        }
+    }
+
+    let frame_mode = match args.frame_mode {
+        CliFrameMode::Alternating => FrameMode::Alternating {
+            max_alternating_cols: args.max_alternating_cols,
+        },
+        CliFrameMode::Strict => FrameMode::Strict,
+    };
+
+    let cfg = DesignConfig {
+        length: args.length,
+        n_cap: if args.no_n_cap { NCap::None } else { NCap::Acetyl },
+        c_cap: if args.no_c_cap { CCap::Hydroxyl } else { CCap::Amide },
+        target_params,
+        frame_mode,
+        constraints: DesignConstraints {
+            allow_cys: args.allow_cys,
+            allow_met: args.allow_met,
+            allow_arg: !args.exclude_arg,
+            allow_pro: args.allow_pro,
+            allow_terminal_pro: args.allow_terminal_pro,
+            min_net_charge: args.min_charge,
+            max_net_charge: args.max_charge,
+            min_trp_tyr: args.min_trp_tyr,
+            max_aromatic: args.max_aromatic,
+            max_his: args.max_his,
+            min_polar: args.min_polar,
+            ..DesignConstraints::default()
+        },
+        specificity_weight: args.specificity_weight,
+        sa_restarts: args.sa_restarts,
+        sa_steps: args.sa_steps,
+        top_k_3d: args.top_k_3d,
+        refine_termini: args.refine,
+        refine_top_n: args.refine_top_n,
+        seed: args.seed,
+        threads: args.threads,
+    };
+
+    let ff = match &args.force_field {
+        Some(p) => BudeForceField::from_file(p)?,
+        None => BudeForceField::load_default()?,
+    };
+    let energy_opts = EnergyOptions {
+        include_interactions: false,
+        no_neighbour_backbone: true,
+        legacy_unassigned_electrostatic_type: args.legacy_electrostatics,
+    };
+    let daspr_cfg = DasprConfig {
+        daspr_bin: args.daspr_bin,
+        rotlib_path: args.rotlib,
+    };
+
+    let surrogate = match &args.pair_csv {
+        Some(path) => Some(PairSurrogateModel::from_csv(path, args.pair_handedness.into())?),
+        None => None,
+    };
+
+    let report = design_sequences(&cfg, surrogate.as_ref(), &ff, &energy_opts, &daspr_cfg)?;
+
+    if let Some(parent) = args.output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&args.output, report.to_csv())?;
+
+    if let Some(pdb_dir) = &args.pdb_dir {
+        fs::create_dir_all(pdb_dir)?;
+        for cand in report.candidates.iter().take(args.top) {
+            let tgt_path = Path::new(pdb_dir).join(format!("design_{:02}_target.pdb", cand.rank));
+            let dec_path = Path::new(pdb_dir).join(format!("design_{:02}_decoy.pdb", cand.rank));
+            fs::write(tgt_path, &cand.target_pdb)?;
+            fs::write(dec_path, &cand.decoy_pdb)?;
+        }
+    }
+
+    print!("{}", report.format_summary(args.top));
+
+    if let Some(plot_path) = &args.plot {
+        let script = find_repo_script("plot_design_pareto.py").ok_or(
+            "could not locate scripts/plot_design_pareto.py relative to cwd or CARGO_MANIFEST_DIR",
+        )?;
+        let status = ProcessCommand::new("python3")
+            .arg(&script)
+            .arg(&args.output)
+            .arg("--output")
+            .arg(plot_path)
+            .arg("--host-energy")
+            .arg(format!("{:.4}", report.host_3d_target_energy))
+            .status()?;
+        if !status.success() {
+            return Err(format!("design Pareto plotting script exited with {status}").into());
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     let res = match cli.command {
@@ -826,6 +1364,8 @@ fn main() {
         Command::Bundle(args) => run_bundle(args),
         Command::Score(args) => run_score(args),
         Command::Optimize(args) => run_optimize(args),
+        Command::ProbePairs(args) => run_probe_pairs(args),
+        Command::DesignSeq(args) => run_design_seq(*args),
     };
     if let Err(err) = res {
         eprintln!("error: {err}");
