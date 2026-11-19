@@ -37,7 +37,18 @@ each helix only as a rigid body.
 
 ## Code layout
 
-The files in `src/` are placeholders for input handling, helix geometry,
-bundles, PDB output, side-chain packing, energy evaluation, and optimisation.
-They do not yet define a stable API. The scaffold can be checked with
-`cargo check` and `cargo test`.
+The modules in `src/` implement input parsing and validation (`input.rs`),
+Crick-style backbone geometry (`geometry.rs`), oligomeric bundle assembly
+(`bundle.rs`), PDB output (`pdb.rs`), side-chain packing via
+[dASPR](https://github.com/Drew-Thomson/dASPR) (`sidechain.rs`), and native
+BUDE force-field evaluation (`energy.rs`). `optimization.rs` remains a
+placeholder for future optimisation methods.
+
+## Acknowledgments
+
+- **[BUDEFF](https://github.com/isambard-uob/budeff)** (MIT License,
+  Copyright (c) 2018 ISAMBARD / Sessions group) and the D-amino acid
+  `bude_2016v1.json` parameterisation for the native Rust energy evaluator in
+  `src/energy.rs`.
+- **[dASPR](https://github.com/Drew-Thomson/dASPR)** (fork of FASPR) for
+  mixed L/D side-chain packing.

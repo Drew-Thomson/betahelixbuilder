@@ -1,0 +1,36 @@
+# Example Differential Evolution optimisation configuration for a D2 Gramicidin A bundle.
+# Run with:
+#   cargo run --release -- optimize --config examples/optimize_d2_gramicidin.yaml -o d2_best.pdb --log-file d2_opt.log --history-csv funnel.csv
+
+symmetry: d2
+keep_gly: false
+objective: internal
+
+de:
+  pop_size: 20
+  generations: 15
+  cxpb: 0.75
+  diff_weight: 1.0
+  # neighbours: 3      # Optional ring neighbourhood radius
+  seed: 42
+  store_history: true
+
+helices:
+  - sequence: "VGAlAvVvWlWlWlW"
+    # Dynamic parameters use { mean: <center>, range: <half_range> } (or [mean, range]).
+    bundle_radius: { mean: 10.5, range: 2.5 }
+    pitch: { mean: 140.0, range: 40.0 }
+    phi_c_alpha_deg: { mean: 0.0, range: 90.0 }
+    # Static parameters use a single scalar value.
+    z_offset: 0.0
+    twist_mode: coupled_darboux
+    # Optional minor beta-helix overrides (defaults to beta_6_3):
+    minor_params:
+      radius_l: 3.77
+      radius_d: 4.11
+      residues_per_turn: 6.11
+      rise_ld: 0.530
+      rise_dl: 0.889
+      tilt_ld_deg: 101.7
+      tilt_dl_deg: -82.6
+      handedness: right
