@@ -7,12 +7,15 @@ use std::process::{self, Command as ProcessCommand};
 
 use betahelixbuilder::{
     AnchorParity, BudeForceField, BundleEnergyReport, BundleSpec, CCap, CanonicalResidue,
-    Chirality, DasprConfig, DesignConfig, DesignConstraints, EnergyOptions, EnergyScore, FrameMode,
-    Handedness, HelixParams, HelixPlacementParams, MonomerSpec, NCap, OptObjective, OptimizeSpec,
-    Orientation, PairSurrogateModel, ParamValue, ProbeConfig, RankBy, ScoredStructure, Sequence,
-    Symmetry, TwistMode, build_beta_helix, build_bundle, bundle_target_sequences,
-    bundle_to_pdb_string, design_sequences, evaluate_bundle, interaction_energy, internal_energy,
-    optimize_bundle, pack_bundle, pack_chain, probe_pair_interactions, to_pdb_string,
+    Chirality, DasprConfig, DesignConfig, DesignConstraints, EdgePattern, EnergyOptions,
+    EnergyScore, FrameMode, Handedness, HelixParams, HelixPlacementParams, HexOligomerTarget,
+    HexamerWorkflowConfig, LumenMode, MonomerSpec, NCap, OligomerState, OligomerWorkflowConfig,
+    OptObjective, OptimizeSpec, Orientation, PairSurrogateModel, ParamValue, ProbeConfig, RankBy,
+    ScoredStructure, SeamComposition, SeamPattern, SeamWidth, Sequence, Symmetry, TwistMode,
+    build_beta_helix, build_bundle, bundle_target_sequences, bundle_to_pdb_string,
+    design_hexamers, design_oligomers, design_sequences, evaluate_bundle, interaction_energy,
+    internal_energy, optimize_bundle, pack_bundle, pack_chain, probe_pair_interactions,
+    to_pdb_string,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -130,6 +133,37 @@ enum CliFrameMode {
     Strict,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliSeamPattern {
+    Strict6,
+    Staggered6676,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliSeamWidth {
+    #[value(name = "1")]
+    One,
+    #[value(name = "2")]
+    Two,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliSeamComp {
+    Aliphatic,
+    Mixed,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliEdgePattern {
+    Parallel,
+    Alternating,
+    Neutral,
+    All,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "betahelixbuilder")]
 #[command(about = "Parametric Crick-style beta-helix monomer, bundle, and BUDE energy tool")]
@@ -152,6 +186,10 @@ enum Command {
     ProbePairs(ProbePairsArgs),
     /// Design stable, handedness-specific repetitive beta-helix sequences (~30 residues).
     DesignSeq(Box<DesignSeqArgs>),
+    /// Design water-soluble seam-bearing beta-helices and assess oligomerization via multi-state DE.
+    DesignOligomers(Box<DesignOligomersArgs>),
+    /// Design two-interface (AB >> AA/BB) asymmetric parallel hexamers (C6) and scale across pools.
+    DesignHexamers(Box<DesignHexamersArgs>),
 }
 
 #[derive(Debug, Args, Default)]
@@ -630,6 +668,14 @@ struct DesignSeqArgs {
     #[arg(long)]
     max_his: Option<usize>,
 
+    /// Optional maximum bulky hydrophobic aliphatic (`Val` + `Leu` + `Ile`) count across the sequence.
+    #[arg(long)]
+    max_aliphatic: Option<usize>,
+
+    /// Forbid continuous vertical `Val`/`Leu`/`Ile` ladders (`col_a[k]` and `col_b[k]` both in `{V,L,I}`).
+    #[arg(long)]
+    no_aliphatic_ladders: bool,
+
     /// Minimum count of soluble polar/charged residues (`S,T,N,Q,H,D,E,K,R`).
     #[arg(long, default_value_t = 0)]
     min_polar: usize,
@@ -697,6 +743,244 @@ struct DesignSeqArgs {
     /// Optional output PNG path for Stability vs Handedness Pareto plot.
     #[arg(long)]
     plot: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct DesignOligomersArgs {
+    /// Precomputed `probe-pairs` CSV file to build Stage-1 surrogate without re-running `probe-pairs`.
+    #[arg(long)]
+    pair_csv: Option<PathBuf>,
+
+    /// Handedness under which `--pair-csv` was recorded (default: right).
+    #[arg(long, value_enum, default_value = "right")]
+    pair_handedness: CliHandedness,
+
+    /// Optional YAML monomer configuration supplying target `HelixParams`.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Target backbone parameter preset.
+    #[arg(long, value_enum)]
+    preset: Option<Preset>,
+
+    /// Designed peptide length (recommended 28-30; default 30).
+    #[arg(long, default_value_t = 30)]
+    length: usize,
+
+    /// Disable N-terminal acetyl cap (`Ac-`).
+    #[arg(long)]
+    no_n_cap: bool,
+
+    /// Disable C-terminal primary amide cap (`-NH2`).
+    #[arg(long)]
+    no_c_cap: bool,
+
+    /// Hydrophobic seam repeating step pattern.
+    #[arg(long, value_enum, default_value = "both")]
+    seam_pattern: CliSeamPattern,
+
+    /// Lateral seam width (1 residue/turn vs 2-residue L+D pair/turn).
+    #[arg(long, value_enum, default_value = "both")]
+    seam_width: CliSeamWidth,
+
+    /// Seam residue composition (`aliphatic` = I/L/V, `mixed` = I/L/V + W/Y/F).
+    #[arg(long, value_enum, default_value = "both")]
+    seam_comp: CliSeamComp,
+
+    /// Seam-flanking charge edge grammar (`parallel` default).
+    #[arg(long, value_enum, default_value = "parallel")]
+    edge_pattern: CliEdgePattern,
+
+    /// Exclude Arginine (`R`/`r`), leaving Lysine as the positive charge option.
+    #[arg(long)]
+    exclude_arg: bool,
+
+    /// Skip adding terminal Trp on pure aliphatic seams.
+    #[arg(long)]
+    no_terminal_wy: bool,
+
+    /// Minimum right-handed monomer gap `E_left - E_right` for gating (default 5.0).
+    #[arg(long, default_value_t = 5.0)]
+    min_hand_gap: f64,
+
+    /// Stage-1 SA restarts per `(pattern, width, comp, edge)` class.
+    #[arg(long, default_value_t = 6)]
+    sa_restarts: usize,
+
+    /// Stage-1 SA steps per restart.
+    #[arg(long, default_value_t = 2500)]
+    sa_steps: usize,
+
+    /// Top diverse monomers carried into multi-state 3D oligomer optimization.
+    #[arg(long, default_value_t = 6)]
+    top_monomers: usize,
+
+    /// Comma-separated oligomer symmetry states to optimize (supports `c2,d1,c3,d2,c4,c6,d3`).
+    #[arg(long, default_value = "c2,d1,c3,d2,c4")]
+    states: String,
+
+    /// Skip the coarse 2D `(bundle_radius, pitch)` pre-screen before DE.
+    #[arg(long)]
+    skip_coarse: bool,
+
+    /// DE population size per oligomer state optimization.
+    #[arg(long, default_value_t = 14)]
+    de_pop: usize,
+
+    /// DE generations per oligomer state optimization.
+    #[arg(long, default_value_t = 12)]
+    de_gens: usize,
+
+    /// Per-chain tail energy drop threshold flagging `still_minimizing` (default 0.25).
+    #[arg(long, default_value_t = 0.25)]
+    tail_drop_tol: f64,
+
+    /// Deterministic PRNG seed.
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+
+    /// Parallel rayon worker threads.
+    #[arg(long)]
+    threads: Option<usize>,
+
+    /// Path to dASPR binary (defaults to DASPR_BIN, PATH, or ~/dASPR/dASPR).
+    #[arg(long)]
+    daspr_bin: Option<PathBuf>,
+
+    /// Path to dASPR rotamer library (`dun2010_mirror.bin`).
+    #[arg(long)]
+    rotlib: Option<PathBuf>,
+
+    /// Override BUDE force-field JSON path.
+    #[arg(long)]
+    force_field: Option<PathBuf>,
+
+    /// Mirror budeff C++ unassigned electrostaticType behavior.
+    #[arg(long)]
+    legacy_electrostatics: bool,
+
+    /// Output directory for `monomer_screen.csv`, `oligomer_screen.csv`, PDBs, and optional plot.
+    #[arg(short, long, default_value = "oligomer_workflow_out")]
+    output_dir: PathBuf,
+
+    /// Generate `oligomer_landscape.png` heatmap and selectivity plot in `--output-dir`.
+    #[arg(long)]
+    plot: bool,
+}
+
+#[derive(Debug, Args)]
+struct DesignHexamersArgs {
+    /// Precomputed `probe-pairs` CSV file to build Stage-1 surrogate without re-running `probe-pairs`.
+    #[arg(long)]
+    pair_csv: Option<PathBuf>,
+
+    /// Handedness under which `--pair-csv` was recorded (default: right).
+    #[arg(long, value_enum, default_value = "right")]
+    pair_handedness: CliHandedness,
+
+    /// Optional YAML monomer configuration supplying target `HelixParams`.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Target backbone parameter preset.
+    #[arg(long, value_enum)]
+    preset: Option<Preset>,
+
+    /// Designed peptide length (recommended 28-30; default 30).
+    #[arg(long, default_value_t = 30)]
+    length: usize,
+
+    /// Target parallel cyclic oligomer stoichiometry (default `6` for C6).
+    #[arg(long, default_value_t = 6)]
+    target_n: usize,
+
+    /// Disable N-terminal acetyl cap (`Ac-`).
+    #[arg(long)]
+    no_n_cap: bool,
+
+    /// Disable C-terminal primary amide cap (`-NH2`).
+    #[arg(long)]
+    no_c_cap: bool,
+
+    /// Seam repeating step schedule (`strict6`, `staggered6676`, or `both`).
+    #[arg(long, value_enum, default_value = "both")]
+    seam_pattern: CliSeamPattern,
+
+    /// Comma-separated central lumen chemistries (`aromatic`, `salt-bridge`, `polar`).
+    #[arg(long, default_value = "aromatic,salt-bridge")]
+    lumen_mode: String,
+
+    /// Exclude Arginine (`R`/`r`), leaving Lysine as positive option.
+    #[arg(long)]
+    exclude_arg: bool,
+
+    /// Minimum right-handed monomer gap `E_left - E_right` (default 5.0).
+    #[arg(long, default_value_t = 5.0)]
+    min_hand_gap: f64,
+
+    /// Stage-1 SA restarts per `(seam_pattern, lumen_mode)` class.
+    #[arg(long, default_value_t = 10)]
+    sa_restarts: usize,
+
+    /// Stage-1 SA steps per restart.
+    #[arg(long, default_value_t = 2500)]
+    sa_steps: usize,
+
+    /// Monomer-gated sequences pushed through flat-parallel Stage 3A coarse multi-state screen.
+    #[arg(long, default_value_t = 20)]
+    coarse_pool: usize,
+
+    /// Top coarse-screen winners promoted to full Stage 3B DE optimization.
+    #[arg(long, default_value_t = 8)]
+    top_de: usize,
+
+    /// Comma-separated targets (supports `c2_aa,c2_bb,c2,c3,c4,c5,c6,c7,d2,d3`).
+    #[arg(long, default_value = "c2_aa,c2_bb,c2,c3,c4,c5,c6,c7,d2,d3")]
+    states: String,
+
+    /// DE population size per promoted `(candidate, state)` refinement.
+    #[arg(long, default_value_t = 16)]
+    de_pop: usize,
+
+    /// DE generations per promoted `(candidate, state)` refinement.
+    #[arg(long, default_value_t = 12)]
+    de_gens: usize,
+
+    /// Per-chain tail energy drop threshold flagging `still_minimizing` (default 0.25).
+    #[arg(long, default_value_t = 0.25)]
+    tail_drop_tol: f64,
+
+    /// Deterministic PRNG seed.
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+
+    /// Parallel rayon worker threads.
+    #[arg(long)]
+    threads: Option<usize>,
+
+    /// Path to dASPR binary (defaults to DASPR_BIN, PATH, or ~/dASPR/dASPR).
+    #[arg(long)]
+    daspr_bin: Option<PathBuf>,
+
+    /// Path to dASPR rotamer library (`dun2010_mirror.bin`).
+    #[arg(long)]
+    rotlib: Option<PathBuf>,
+
+    /// Override BUDE force-field JSON path.
+    #[arg(long)]
+    force_field: Option<PathBuf>,
+
+    /// Mirror budeff C++ unassigned electrostaticType behavior.
+    #[arg(long)]
+    legacy_electrostatics: bool,
+
+    /// Output directory for `monomer_screen.csv`, `coarse_screen.csv`, `hexamer_screen.csv`, PDBs, and optional plot.
+    #[arg(short, long, default_value = "hexamer_workflow_out")]
+    output_dir: PathBuf,
+
+    /// Generate `hexamer_landscape.png` heatmap and pore/selectivity plot in `--output-dir`.
+    #[arg(long)]
+    plot: bool,
 }
 
 fn default_sequence(preset: Preset) -> &'static str {
@@ -1285,6 +1569,8 @@ fn run_design_seq(args: DesignSeqArgs) -> Result<(), Box<dyn std::error::Error>>
             min_trp_tyr: args.min_trp_tyr,
             max_aromatic: args.max_aromatic,
             max_his: args.max_his,
+            max_aliphatic: args.max_aliphatic,
+            no_aliphatic_ladders: args.no_aliphatic_ladders,
             min_polar: args.min_polar,
             ..DesignConstraints::default()
         },
@@ -1357,6 +1643,232 @@ fn run_design_seq(args: DesignSeqArgs) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+fn resolve_target_helix_params(
+    config: Option<&PathBuf>,
+    preset: Option<Preset>,
+) -> Result<HelixParams, Box<dyn std::error::Error>> {
+    let mut target_params = HelixParams::beta_6_3();
+    if let Some(config_path) = config {
+        let mono = serde_yml::from_str::<MonomerSpec>(&fs::read_to_string(config_path)?)?;
+        target_params = mono.params;
+    }
+    if let Some(p) = preset {
+        target_params = preset_params(p);
+    }
+    Ok(target_params)
+}
+
+fn parse_seam_patterns(cli: CliSeamPattern) -> Vec<SeamPattern> {
+    match cli {
+        CliSeamPattern::Strict6 => vec![SeamPattern::Strict6],
+        CliSeamPattern::Staggered6676 => vec![SeamPattern::Staggered6676],
+        CliSeamPattern::Both => vec![SeamPattern::Strict6, SeamPattern::Staggered6676],
+    }
+}
+
+fn run_design_oligomers(args: DesignOligomersArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let target_params = resolve_target_helix_params(args.config.as_ref(), args.preset)?;
+    let seam_patterns = parse_seam_patterns(args.seam_pattern);
+    let seam_widths = match args.seam_width {
+        CliSeamWidth::One => vec![SeamWidth::Single],
+        CliSeamWidth::Two => vec![SeamWidth::PairedLD],
+        CliSeamWidth::Both => vec![SeamWidth::Single, SeamWidth::PairedLD],
+    };
+    let seam_compositions = match args.seam_comp {
+        CliSeamComp::Aliphatic => vec![SeamComposition::AliphaticOnly],
+        CliSeamComp::Mixed => vec![SeamComposition::MixedAliphaticAromatic],
+        CliSeamComp::Both => vec![
+            SeamComposition::AliphaticOnly,
+            SeamComposition::MixedAliphaticAromatic,
+        ],
+    };
+    let edge_patterns = match args.edge_pattern {
+        CliEdgePattern::Parallel => vec![EdgePattern::ParallelBias],
+        CliEdgePattern::Alternating => vec![EdgePattern::Alternating],
+        CliEdgePattern::Neutral => vec![EdgePattern::NeutralPolar],
+        CliEdgePattern::All => vec![
+            EdgePattern::ParallelBias,
+            EdgePattern::Alternating,
+            EdgePattern::NeutralPolar,
+        ],
+    };
+
+    let mut states = Vec::new();
+    for tok in args.states.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        states.push(OligomerState::parse(tok)?);
+    }
+
+    let cfg = OligomerWorkflowConfig {
+        length: args.length,
+        n_cap: if args.no_n_cap { NCap::None } else { NCap::Acetyl },
+        c_cap: if args.no_c_cap { CCap::Hydroxyl } else { CCap::Amide },
+        target_params,
+        seam_patterns,
+        seam_widths,
+        seam_compositions,
+        edge_patterns,
+        exclude_arg: args.exclude_arg,
+        allow_terminal_wy: !args.no_terminal_wy,
+        min_monomer_hand_gap: args.min_hand_gap,
+        sa_restarts_per_class: args.sa_restarts,
+        sa_steps: args.sa_steps,
+        top_monomers: args.top_monomers,
+        states,
+        run_coarse_screen: !args.skip_coarse,
+        de_pop_size: args.de_pop,
+        de_generations: args.de_gens,
+        tail_drop_tol_per_chain: args.tail_drop_tol,
+        seed: args.seed,
+        threads: args.threads,
+        ..OligomerWorkflowConfig::default()
+    };
+
+    let ff = match &args.force_field {
+        Some(p) => BudeForceField::from_file(p)?,
+        None => BudeForceField::load_default()?,
+    };
+    let energy_opts = EnergyOptions {
+        include_interactions: false,
+        no_neighbour_backbone: true,
+        legacy_unassigned_electrostatic_type: args.legacy_electrostatics,
+    };
+    let daspr_cfg = DasprConfig {
+        daspr_bin: args.daspr_bin,
+        rotlib_path: args.rotlib,
+    };
+    let surrogate = match &args.pair_csv {
+        Some(path) => Some(PairSurrogateModel::from_csv(path, args.pair_handedness.into())?),
+        None => None,
+    };
+
+    let report = design_oligomers(&cfg, surrogate.as_ref(), &ff, &energy_opts, &daspr_cfg)?;
+
+    fs::create_dir_all(&args.output_dir)?;
+    let mono_csv = args.output_dir.join("monomer_screen.csv");
+    let oligo_csv = args.output_dir.join("oligomer_screen.csv");
+    let pdb_dir = args.output_dir.join("pdbs");
+    fs::write(&mono_csv, report.monomer_csv())?;
+    fs::write(&oligo_csv, report.oligomer_csv())?;
+    fs::create_dir_all(&pdb_dir)?;
+    for ev in &report.evaluations {
+        let pdb_path = pdb_dir.join(format!("cand_{:02}_{}.pdb", ev.candidate_id, ev.state_label));
+        fs::write(pdb_path, &ev.best_pdb)?;
+    }
+
+    print!("{}", report.format_summary());
+
+    if args.plot {
+        let script = find_repo_script("plot_oligomer_landscape.py").ok_or(
+            "could not locate scripts/plot_oligomer_landscape.py relative to cwd or CARGO_MANIFEST_DIR",
+        )?;
+        let plot_path = args.output_dir.join("oligomer_landscape.png");
+        let status = ProcessCommand::new("python3")
+            .arg(&script)
+            .arg(&mono_csv)
+            .arg(&oligo_csv)
+            .arg("--output")
+            .arg(&plot_path)
+            .status()?;
+        if !status.success() {
+            return Err(format!("oligomer landscape script exited with {status}").into());
+        }
+    }
+    Ok(())
+}
+
+fn run_design_hexamers(args: DesignHexamersArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let target_params = resolve_target_helix_params(args.config.as_ref(), args.preset)?;
+    let seam_patterns = parse_seam_patterns(args.seam_pattern);
+
+    let mut lumen_modes = Vec::new();
+    for tok in args.lumen_mode.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        lumen_modes.push(LumenMode::parse(tok)?);
+    }
+    let mut states = Vec::new();
+    for tok in args.states.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        states.push(HexOligomerTarget::parse(tok)?);
+    }
+
+    let cfg = HexamerWorkflowConfig {
+        length: args.length,
+        n_cap: if args.no_n_cap { NCap::None } else { NCap::Acetyl },
+        c_cap: if args.no_c_cap { CCap::Hydroxyl } else { CCap::Amide },
+        target_params,
+        target_oligomer_n: args.target_n,
+        seam_patterns,
+        lumen_modes,
+        exclude_arg: args.exclude_arg,
+        min_monomer_hand_gap: args.min_hand_gap,
+        sa_restarts_per_class: args.sa_restarts,
+        sa_steps: args.sa_steps,
+        coarse_pool_size: args.coarse_pool,
+        top_de: args.top_de,
+        states,
+        de_pop_size: args.de_pop,
+        de_generations: args.de_gens,
+        tail_drop_tol_per_chain: args.tail_drop_tol,
+        seed: args.seed,
+        threads: args.threads,
+        ..HexamerWorkflowConfig::default()
+    };
+
+    let ff = match &args.force_field {
+        Some(p) => BudeForceField::from_file(p)?,
+        None => BudeForceField::load_default()?,
+    };
+    let energy_opts = EnergyOptions {
+        include_interactions: false,
+        no_neighbour_backbone: true,
+        legacy_unassigned_electrostatic_type: args.legacy_electrostatics,
+    };
+    let daspr_cfg = DasprConfig {
+        daspr_bin: args.daspr_bin,
+        rotlib_path: args.rotlib,
+    };
+    let surrogate = match &args.pair_csv {
+        Some(path) => Some(PairSurrogateModel::from_csv(path, args.pair_handedness.into())?),
+        None => None,
+    };
+
+    let report = design_hexamers(&cfg, surrogate.as_ref(), &ff, &energy_opts, &daspr_cfg)?;
+
+    fs::create_dir_all(&args.output_dir)?;
+    let mono_csv = args.output_dir.join("monomer_screen.csv");
+    let coarse_csv = args.output_dir.join("coarse_screen.csv");
+    let hex_csv = args.output_dir.join("hexamer_screen.csv");
+    let pdb_dir = args.output_dir.join("pdbs");
+    fs::write(&mono_csv, report.monomer_csv())?;
+    fs::write(&coarse_csv, report.coarse_csv())?;
+    fs::write(&hex_csv, report.hexamer_csv())?;
+    fs::create_dir_all(&pdb_dir)?;
+    for ev in &report.de_evaluations {
+        let pdb_path = pdb_dir.join(format!("cand_{:02}_{}.pdb", ev.candidate_id, ev.state_label));
+        fs::write(pdb_path, &ev.best_pdb)?;
+    }
+
+    print!("{}", report.format_summary());
+
+    if args.plot {
+        let script = find_repo_script("plot_hexamer_landscape.py").ok_or(
+            "could not locate scripts/plot_hexamer_landscape.py relative to cwd or CARGO_MANIFEST_DIR",
+        )?;
+        let plot_path = args.output_dir.join("hexamer_landscape.png");
+        let status = ProcessCommand::new("python3")
+            .arg(&script)
+            .arg(&mono_csv)
+            .arg(&hex_csv)
+            .arg("--target-state")
+            .arg(&report.target_state_label)
+            .arg("--output")
+            .arg(&plot_path)
+            .status()?;
+        if !status.success() {
+            return Err(format!("hexamer landscape script exited with {status}").into());
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     let res = match cli.command {
@@ -1366,6 +1878,8 @@ fn main() {
         Command::Optimize(args) => run_optimize(args),
         Command::ProbePairs(args) => run_probe_pairs(args),
         Command::DesignSeq(args) => run_design_seq(*args),
+        Command::DesignOligomers(args) => run_design_oligomers(*args),
+        Command::DesignHexamers(args) => run_design_hexamers(*args),
     };
     if let Err(err) = res {
         eprintln!("error: {err}");

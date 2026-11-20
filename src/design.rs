@@ -68,6 +68,14 @@ fn is_aromatic_fyw(aa: CanonicalResidue) -> bool {
     )
 }
 
+/// True for bulky hydrophobic aliphatic residues (`Val`, `Leu`, `Ile`).
+fn is_aliphatic_vli(aa: CanonicalResidue) -> bool {
+    matches!(
+        aa,
+        CanonicalResidue::Val | CanonicalResidue::Leu | CanonicalResidue::Ile
+    )
+}
+
 /// True for hydrophilic/polar or charged water-solubilizing residues.
 fn is_polar_soluble(aa: CanonicalResidue) -> bool {
     matches!(
@@ -128,6 +136,10 @@ pub struct DesignConstraints {
     pub max_aromatic: Option<usize>,
     /// Optional cap on Histidine (`His`) residues across the peptide.
     pub max_his: Option<usize>,
+    /// Optional cap on bulky hydrophobic aliphatic (`Val` + `Leu` + `Ile`) residues across the peptide.
+    pub max_aliphatic: Option<usize>,
+    /// Disallow continuous vertical `Val`/`Leu`/`Ile` ladders (`col_a[k]` and `col_b[k]` both in `{V,L,I}`).
+    pub no_aliphatic_ladders: bool,
     /// Minimum total count of polar/charged water-solubilizing residues (`S,T,N,Q,H,D,E,K,R`).
     pub min_polar: usize,
 }
@@ -146,6 +158,8 @@ impl Default for DesignConstraints {
             min_trp_tyr: 1,
             max_aromatic: None,
             max_his: None,
+            max_aliphatic: None,
+            no_aliphatic_ladders: false,
             min_polar: 0,
         }
     }
@@ -156,6 +170,7 @@ struct SeqStats {
     net_charge: i32,
     trp_tyr: usize,
     aromatic_fyw: usize,
+    aliphatic_vli: usize,
     his_count: usize,
     polar_count: usize,
 }
@@ -169,6 +184,9 @@ fn compute_seq_stats_iter<I: Iterator<Item = CanonicalResidue>>(residues: I) -> 
         }
         if is_aromatic_fyw(aa) {
             s.aromatic_fyw += 1;
+        }
+        if is_aliphatic_vli(aa) {
+            s.aliphatic_vli += 1;
         }
         if aa == CanonicalResidue::His {
             s.his_count += 1;
@@ -216,6 +234,7 @@ impl DesignConstraints {
             && s.trp_tyr >= self.min_trp_tyr
             && self.max_aromatic.is_none_or(|cap| s.aromatic_fyw <= cap)
             && self.max_his.is_none_or(|cap| s.his_count <= cap)
+            && self.max_aliphatic.is_none_or(|cap| s.aliphatic_vli <= cap)
             && s.polar_count >= self.min_polar
     }
 
@@ -564,6 +583,7 @@ pub struct DesignCandidate {
     pub net_charge: i32,
     pub trp_tyr_count: usize,
     pub aromatic_count: usize,
+    pub aliphatic_count: usize,
     pub polar_count: usize,
     pub surr_target_de_vs_ala: f64,
     pub surr_decoy_de_vs_ala: f64,
@@ -616,7 +636,7 @@ impl DesignReport {
             let pareto_tag = if c.pareto_optimal { " [PARETO]" } else { "" };
             let ref_tag = if c.refined_termini { " [REFINED]" } else { "" };
             out.push_str(&format!(
-                "  #{:2} {}{}{} | A={} B={} alt={} q={:+} Ar={} Pol={}\n      3D: E_tgt={:.3} (st={:.2}, de={:.2}, ch={:.2})  E_decoy={:.3}  gap={:+.3}  dE_vs_Ala={:+.3}  score={:.3}\n      Surr: dE_tgt={:+.3}  dE_decoy={:+.3}  gap={:+.3}\n",
+                "  #{:2} {}{}{} | A={} B={} alt={} q={:+} Ar={} Al={} Pol={}\n      3D: E_tgt={:.3} (st={:.2}, de={:.2}, ch={:.2})  E_decoy={:.3}  gap={:+.3}  dE_vs_Ala={:+.3}  score={:.3}\n      Surr: dE_tgt={:+.3}  dE_decoy={:+.3}  gap={:+.3}\n",
                 c.rank,
                 c.sequence_with_caps,
                 pareto_tag,
@@ -626,6 +646,7 @@ impl DesignReport {
                 c.alternating_cols,
                 c.net_charge,
                 c.aromatic_count,
+                c.aliphatic_count,
                 c.polar_count,
                 c.e_3d_target,
                 c.e_3d_target_steric,
@@ -646,11 +667,11 @@ impl DesignReport {
     /// Exports all Stage-2 ranked candidates as CSV.
     pub fn to_csv(&self) -> String {
         let mut out = String::from(
-            "rank,sequence_with_caps,sequence_core,frame_a,frame_b,alternating_cols,net_charge,trp_tyr_count,aromatic_count,polar_count,surr_target_dE,surr_decoy_dE,surr_hand_gap,e_3d_target,e_3d_target_steric,e_3d_target_desolvation,e_3d_target_charge,e_3d_decoy,e_3d_decoy_steric,e_3d_decoy_desolvation,e_3d_decoy_charge,e_3d_hand_gap,dE_3d_vs_ala_host,score_3d,pareto_optimal,refined_termini\n",
+            "rank,sequence_with_caps,sequence_core,frame_a,frame_b,alternating_cols,net_charge,trp_tyr_count,aromatic_count,aliphatic_count,polar_count,surr_target_dE,surr_decoy_dE,surr_hand_gap,e_3d_target,e_3d_target_steric,e_3d_target_desolvation,e_3d_target_charge,e_3d_decoy,e_3d_decoy_steric,e_3d_decoy_desolvation,e_3d_decoy_charge,e_3d_hand_gap,dE_3d_vs_ala_host,score_3d,pareto_optimal,refined_termini\n",
         );
         for c in &self.candidates {
             out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{}\n",
                 c.rank,
                 c.sequence_with_caps,
                 c.sequence_core,
@@ -660,6 +681,7 @@ impl DesignReport {
                 c.net_charge,
                 c.trp_tyr_count,
                 c.aromatic_count,
+                c.aliphatic_count,
                 c.polar_count,
                 c.surr_target_de_vs_ala,
                 c.surr_decoy_de_vs_ala,
@@ -692,6 +714,10 @@ struct RepeatTemplate {
 impl RepeatTemplate {
     fn alternating_cols(&self) -> usize {
         (0..6).filter(|&k| self.col_a[k] != self.col_b[k]).count()
+    }
+
+    fn has_pure_aliphatic_ladder(&self) -> bool {
+        (0..6).any(|k| is_aliphatic_vli(self.col_a[k]) && is_aliphatic_vli(self.col_b[k]))
     }
 
     fn expand_indices(&self, length: usize) -> Vec<usize> {
@@ -771,6 +797,7 @@ struct Stage1Candidate {
     net_charge: i32,
     trp_tyr_count: usize,
     aromatic_count: usize,
+    aliphatic_count: usize,
     polar_count: usize,
     surr_target_de: f64,
     surr_decoy_de: f64,
@@ -868,8 +895,20 @@ fn build_seed_template(
             col_a: [*core_alpha.choose(rng).unwrap(); 6],
             col_b: [CanonicalResidue::Ala; 6],
         };
+        let polar_safe: Vec<CanonicalResidue> = core_alpha
+            .iter()
+            .copied()
+            .filter(|&a| residue_formal_charge(a) == 0 && !is_aliphatic_vli(a) && !is_aromatic_fyw(a))
+            .collect();
+
         for (i, slot) in tpl.col_a.iter_mut().enumerate() {
-            if !neutrals.is_empty() && rng.random_bool(0.7) {
+            let prefer_safe = (config.constraints.no_aliphatic_ladders
+                || config.constraints.max_aliphatic.is_some_and(|c| c < 5)
+                || config.constraints.max_aromatic.is_some_and(|c| c < 5))
+                && !polar_safe.is_empty();
+            if prefer_safe && rng.random_bool(0.85) {
+                *slot = *polar_safe.choose(rng).unwrap();
+            } else if !neutrals.is_empty() && rng.random_bool(0.7) {
                 *slot = *neutrals.choose(rng).unwrap();
             } else {
                 *slot = *core_alpha.choose(rng).unwrap();
@@ -878,6 +917,11 @@ fn build_seed_template(
         }
 
         let alt_col = rng.random_range(0..6);
+        let aliph_list: Vec<CanonicalResidue> = core_alpha
+            .iter()
+            .copied()
+            .filter(|&a| is_aliphatic_vli(a))
+            .collect();
         if max_alt > 0 && !positives.is_empty() && !negatives.is_empty() {
             let n_alt = rng.random_range(1..=max_alt);
             let mut cols: Vec<usize> = (0..6).collect();
@@ -887,9 +931,15 @@ fn build_seed_template(
                 let col = cols[j];
                 if j == 1 && !aromatics.is_empty() && config.constraints.max_aromatic.is_some_and(|c| c < 5) {
                     let ar = *aromatics.choose(rng).unwrap();
-                    let filler = CanonicalResidue::Gln;
-                    tpl.col_a[col] = if neutrals.contains(&filler) { filler } else { CanonicalResidue::Ala };
-                    tpl.col_b[col] = ar; // 2 aromatic occurrences across 30-mer
+                    let filler = if !aliph_list.is_empty() && rng.random_bool(0.5) {
+                        *aliph_list.choose(rng).unwrap()
+                    } else if neutrals.contains(&CanonicalResidue::Gln) {
+                        CanonicalResidue::Gln
+                    } else {
+                        CanonicalResidue::Ala
+                    };
+                    tpl.col_a[col] = filler;
+                    tpl.col_b[col] = ar; // sparse alternating aromatic (2 copies, or paired with Leu/Gln)
                 } else if rng.random_bool(0.5) {
                     tpl.col_a[col] = *positives.choose(rng).unwrap();
                     tpl.col_b[col] = *negatives.choose(rng).unwrap();
@@ -918,7 +968,10 @@ fn build_seed_template(
         }
 
         let seq = tpl.expand_sequence(config.length, config.n_cap, config.c_cap);
-        if tpl.alternating_cols() <= max_alt && config.constraints.satisfies_sequence(&seq) {
+        if tpl.alternating_cols() <= max_alt
+            && !(config.constraints.no_aliphatic_ladders && tpl.has_pure_aliphatic_ladder())
+            && config.constraints.satisfies_sequence(&seq)
+        {
             return Ok(tpl);
         }
     }
@@ -934,7 +987,7 @@ fn build_seed_template(
         for &neg_aa in &negatives {
             for &ar in &aromatics {
                 for &pol1 in &polar_fillers {
-                    for &pol2 in &[CanonicalResidue::Leu, CanonicalResidue::Asn, CanonicalResidue::Ser] {
+                    for &pol2 in &[CanonicalResidue::Asn, CanonicalResidue::Ser, CanonicalResidue::Gln] {
                         let mut tpl = RepeatTemplate {
                             col_a: [
                                 CanonicalResidue::Gln,
@@ -966,7 +1019,11 @@ fn build_seed_template(
                             tpl.col_b[4] = pos_aa;
                         }
                         let seq = tpl.expand_sequence(config.length, config.n_cap, config.c_cap);
-                        if tpl.alternating_cols() <= max_alt && config.constraints.satisfies_sequence(&seq) {
+                        if tpl.alternating_cols() <= max_alt
+                            && !(config.constraints.no_aliphatic_ladders
+                                && tpl.has_pure_aliphatic_ladder())
+                            && config.constraints.satisfies_sequence(&seq)
+                        {
                             return Ok(tpl);
                         }
                     }
@@ -1128,6 +1185,7 @@ fn run_stage1_sa(
                             net_charge: st_stats.net_charge,
                             trp_tyr_count: st_stats.trp_tyr,
                             aromatic_count: st_stats.aromatic_fyw,
+                            aliphatic_count: st_stats.aliphatic_vli,
                             polar_count: st_stats.polar_count,
                             surr_target_de: tg,
                             surr_decoy_de: dc,
@@ -1144,7 +1202,10 @@ fn run_stage1_sa(
                     let frac = step as f64 / steps_f;
                     let temp = t_start * (t_end / t_start).powf(frac);
                     let cand_tpl = mutate_template(&mut rng, &tpl, max_alt, &core_alpha);
-                    if cand_tpl.alternating_cols() > max_alt {
+                    if cand_tpl.alternating_cols() > max_alt
+                        || (config.constraints.no_aliphatic_ladders
+                            && cand_tpl.has_pure_aliphatic_ladder())
+                    {
                         continue;
                     }
                     let cand_idx = cand_tpl.expand_indices(config.length);
@@ -1303,6 +1364,7 @@ fn apply_3d_result(
     cand.net_charge = stats.net_charge;
     cand.trp_tyr_count = stats.trp_tyr;
     cand.aromatic_count = stats.aromatic_fyw;
+    cand.aliphatic_count = stats.aliphatic_vli;
     cand.polar_count = stats.polar_count;
     cand.surr_target_de_vs_ala = st;
     cand.surr_decoy_de_vs_ala = sd;
@@ -1471,6 +1533,7 @@ fn run_design_pipeline(
                     net_charge: s1.net_charge,
                     trp_tyr_count: s1.trp_tyr_count,
                     aromatic_count: s1.aromatic_count,
+                    aliphatic_count: s1.aliphatic_count,
                     polar_count: s1.polar_count,
                     surr_target_de_vs_ala: s1.surr_target_de,
                     surr_decoy_de_vs_ala: s1.surr_decoy_de,
@@ -1636,11 +1699,11 @@ impl From<SidechainError> for DesignError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::probe::{PairProbeRow, ProbeReport, RankBy};
 
-    fn synthetic_surrogate() -> PairSurrogateModel {
+    pub(crate) fn synthetic_surrogate() -> PairSurrogateModel {
         let make_row = |anchor: Chirality, off: isize, ri: char, rj: char, dde: f64, exa: f64| PairProbeRow {
             anchor_chirality: anchor,
             anchor_seq_id: 9,
@@ -1773,6 +1836,8 @@ mod tests {
             allow_arg: false,
             max_aromatic: Some(3),
             max_his: Some(5),
+            max_aliphatic: Some(4),
+            no_aliphatic_ladders: true,
             min_polar: 14,
             ..DesignConstraints::default()
         };
@@ -1793,6 +1858,7 @@ mod tests {
             assert!(cfg.constraints.satisfies_sequence(&seq));
             assert!(!seq.to_daspr_string().contains(['R', 'r']));
             assert!(c.aromatic_count <= 3);
+            assert!(c.aliphatic_count <= 4);
             assert!(c.polar_count >= 14);
         }
     }

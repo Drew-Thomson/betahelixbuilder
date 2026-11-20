@@ -630,6 +630,16 @@ pub struct NamedParamValue {
     pub normalized: f64,
 }
 
+/// Diagnostic summary checking whether Differential Evolution had converged by termination.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConvergenceStats {
+    pub tail_drop_per_chain: f64,
+    pub last_gen_drop_per_chain: f64,
+    pub final_pop_std_per_chain: f64,
+    pub still_minimizing: bool,
+    pub boundary_hits: usize,
+}
+
 /// Complete result of `optimize_bundle`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptimizeResult {
@@ -644,6 +654,45 @@ pub struct OptimizeResult {
 }
 
 impl OptimizeResult {
+    /// Checks whether the optimization trajectory was still noticeably decreasing at termination.
+    pub fn convergence_diagnostics(
+        &self,
+        num_chains: usize,
+        tail_gens: usize,
+        tail_tol_per_chain: f64,
+        last_tol_per_chain: f64,
+    ) -> ConvergenceStats {
+        let m = num_chains.max(1) as f64;
+        let len = self.logbook.len();
+        if len < 2 {
+            return ConvergenceStats {
+                tail_drop_per_chain: 0.0,
+                last_gen_drop_per_chain: 0.0,
+                final_pop_std_per_chain: self.logbook.last().map_or(0.0, |g| g.std / m),
+                still_minimizing: false,
+                boundary_hits: self.boundary_warnings.len(),
+            };
+        }
+        let last = &self.logbook[len - 1];
+        let prev = &self.logbook[len - 2];
+        let tail_idx = len.saturating_sub(tail_gens.max(1) + 1);
+        let tail_start = &self.logbook[tail_idx];
+
+        let tail_drop_per_chain = (tail_start.min - last.min).max(0.0) / m;
+        let last_gen_drop_per_chain = (prev.min - last.min).max(0.0) / m;
+        let final_pop_std_per_chain = last.std / m;
+        let still_minimizing =
+            tail_drop_per_chain > tail_tol_per_chain || last_gen_drop_per_chain > last_tol_per_chain;
+
+        ConvergenceStats {
+            tail_drop_per_chain,
+            last_gen_drop_per_chain,
+            final_pop_std_per_chain,
+            still_minimizing,
+            boundary_hits: self.boundary_warnings.len(),
+        }
+    }
+
     /// Formats a concise generation logbook, final parameter summary, and boundary warnings.
     pub fn format_log(&self) -> String {
         let mut out = String::new();
@@ -950,5 +999,42 @@ helices:
         };
         let err = optimize_bundle(&spec, &ff, &EnergyOptions::standard(), &daspr).unwrap_err();
         assert!(matches!(err, OptError::Sidechain(SidechainError::DasprNotFound(_))));
+    }
+
+    #[test]
+    fn convergence_diagnostics_flags_dropping_tail_vs_flat_tail() {
+        let make_res = |mins: &[f64]| OptimizeResult {
+            best_spec: BundleSpec::default(),
+            best_parameters: Vec::new(),
+            best_energy: BundleEnergyReport {
+                internal: crate::energy::EnergyScore::default(),
+                interaction: crate::energy::EnergyScore::default(),
+            },
+            best_pdb: String::new(),
+            total_evals: 0,
+            logbook: mins
+                .iter()
+                .enumerate()
+                .map(|(g, &m)| GenerationStats {
+                    generation: g,
+                    evals: 16,
+                    min: m,
+                    avg: m + 5.0,
+                    std: 2.0,
+                    max: m + 10.0,
+                })
+                .collect(),
+            history: Vec::new(),
+            boundary_warnings: Vec::new(),
+        };
+
+        let dropping = make_res(&[-100.0, -104.0, -108.0, -112.0]);
+        let st_drop = dropping.convergence_diagnostics(2, 3, 0.25, 0.05);
+        assert!(st_drop.still_minimizing);
+        assert!((st_drop.tail_drop_per_chain - 6.0).abs() < 1e-12);
+
+        let plateaued = make_res(&[-100.0, -112.0, -112.01, -112.02]);
+        let st_flat = plateaued.convergence_diagnostics(2, 2, 0.25, 0.05);
+        assert!(!st_flat.still_minimizing);
     }
 }

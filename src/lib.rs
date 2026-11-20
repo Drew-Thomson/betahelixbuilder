@@ -11,7 +11,9 @@ pub mod bundle;
 pub mod design;
 pub mod energy;
 pub mod geometry;
+pub mod hexamer;
 pub mod input;
+pub mod oligomer;
 pub mod optimization;
 pub mod pdb;
 pub mod probe;
@@ -33,13 +35,23 @@ pub use geometry::{
     bond_angle_deg, bond_length, build_beta_helix, build_helix_along_curve, dihedral_deg,
     improper_chirality_deg, kabsch_rmsd,
 };
+pub use hexamer::{
+    HexCoarseEval, HexMonomerCandidate, HexOligomerEval, HexOligomerTarget, HexSeamLayout,
+    HexStateKind, HexamerWorkflowConfig, HexamerWorkflowReport, LumenMode, design_hexamers,
+    measure_pore_diameter_angstrom,
+};
 pub use input::{
     BundleSpec, CCap, CanonicalResidue, Chirality, Handedness, HelixParams, HelixPlacementParams,
     InputError, MonomerSpec, NCap, Orientation, ResidueSpec, Sequence, Symmetry, TwistMode,
 };
+pub use oligomer::{
+    EdgePattern, MonomerGateCandidate, OligomerError, OligomerEval, OligomerState,
+    OligomerWorkflowConfig, OligomerWorkflowReport, SeamComposition, SeamLayout, SeamPattern,
+    SeamWidth, design_oligomers,
+};
 pub use optimization::{
-    DeConfig, DeSolverResult, EvalRecord, GenerationStats, NamedParamValue, OptError,
-    OptHelixSpec, OptObjective, OptimizeResult, OptimizeSpec, ParamDescriptor, ParamRange,
+    ConvergenceStats, DeConfig, DeSolverResult, EvalRecord, GenerationStats, NamedParamValue,
+    OptError, OptHelixSpec, OptObjective, OptimizeResult, OptimizeSpec, ParamDescriptor, ParamRange,
     ParamValue, differential_evolution, optimize_bundle,
 };
 pub use pdb::{bundle_to_pdb_string, to_pdb_string, write_bundle_pdb, write_pdb};
